@@ -38,17 +38,19 @@ struct App {
     rx: crossbeam::channel::Receiver<capture::KeyEvent>,
     tray_rx: crossbeam::channel::Receiver<tray::TrayAction>,
     display_cfg: config::DisplayConfig,
-    hidden: Arc<Mutex<bool>>,
+    tray_hidden: Arc<Mutex<bool>>,
+    showing: bool,
+    needs_hide: bool,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = WindowAttributes::default()
             .with_decorations(false)
-            .with_transparent(true)
             .with_inner_size(PhysicalSize::new(640, 60));
         self.window = Some(event_loop.create_window(attrs).unwrap());
         if let Some(win) = &self.window { hide_from_taskbar(win); }
+        event_loop.set_control_flow(ControlFlow::Poll);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -64,22 +66,45 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let mut changed = false;
         while let Ok(e) = self.rx.try_recv() {
             self.mode.lock().unwrap().push_event(e);
-            changed = true;
         }
         while let Ok(a) = self.tray_rx.try_recv() {
             use tray::TrayAction;
             match a {
-                TrayAction::ShowHide => { *self.hidden.lock().unwrap() ^= true; }
+                TrayAction::ShowHide => { *self.tray_hidden.lock().unwrap() ^= true; }
                 TrayAction::ToggleMode => {},
                 TrayAction::Quit => event_loop.exit(),
             }
         }
-        if !*self.hidden.lock().unwrap() {
-            let labels = self.mode.lock().unwrap().render(Instant::now());
-            if changed || labels.iter().any(|l| l.opacity > 0.02) {
+
+        if *self.tray_hidden.lock().unwrap() {
+            if self.showing {
+                if let Some(win) = &self.window { win.set_visible(false); }
+                self.showing = false;
+                self.needs_hide = false;
+            }
+            return;
+        }
+
+        let labels = self.mode.lock().unwrap().render(Instant::now());
+        let has_content = labels.iter().any(|l| l.opacity > 0.02);
+
+        if has_content {
+            self.needs_hide = false;
+            if !self.showing {
+                if let Some(win) = &self.window { win.set_visible(true); }
+                self.showing = true;
+            }
+            if let Some(win) = &self.window { win.request_redraw(); }
+        } else if self.showing {
+            // Redraw one frame for fade-out, then hide
+            if self.needs_hide {
+                if let Some(win) = &self.window { win.set_visible(false); }
+                self.showing = false;
+                self.needs_hide = false;
+            } else {
+                self.needs_hide = true;
                 if let Some(win) = &self.window { win.request_redraw(); }
             }
         }
@@ -93,7 +118,10 @@ fn redraw(window: &Window, mode: &Arc<Mutex<Box<dyn DisplayMode>>>, cfg: &config
     let h = size.height.max(1);
 
     let mut pm = tiny_skia::Pixmap::new(w, h).unwrap();
-    pm.fill(tiny_skia::Color::TRANSPARENT);
+
+    // Dark semi-transparent panel background
+    let panel_color = parse_color(cfg.bg_color.as_str(), 0.88);
+    pm.fill(panel_color);
 
     let pills: Vec<_> = labels.into_iter().filter(|l| l.opacity > 0.02).collect();
     if !pills.is_empty() {
@@ -103,20 +131,25 @@ fn redraw(window: &Window, mode: &Arc<Mutex<Box<dyn DisplayMode>>>, cfg: &config
     use raw_window_handle::{HasWindowHandle, HasDisplayHandle};
     let wh = window.window_handle().unwrap();
     let dh = window.display_handle().unwrap();
-    let ctx = softbuffer::Context::new(dh).unwrap();
-    let mut surface = softbuffer::Surface::new(&ctx, wh).unwrap();
-    let mut buf = surface.buffer_mut().unwrap();
-    let bw = buf.width().get();
-    let bh = buf.height().get();
-    for y in 0..h.min(bh) {
-        for x in 0..w.min(bw) {
-            let si = ((y * w + x) * 4) as usize;
-            let (r, g, b) = (pm.data()[si], pm.data()[si + 1], pm.data()[si + 2]);
-            let di = (y * bw + x) as usize;
-            buf[di] = u32::from_ne_bytes([b, g, r, 0]);
+    if let Ok(ctx) = softbuffer::Context::new(dh) {
+        if let Ok(mut surface) = softbuffer::Surface::new(&ctx, wh) {
+            if let Ok(mut buf) = surface.buffer_mut() {
+                let bw = buf.width().get();
+                let bh = buf.height().get();
+                for y in 0..h.min(bh) {
+                    for x in 0..w.min(bw) {
+                        let si = ((y * w + x) * 4) as usize;
+                        let di = (y * bw + x) as usize;
+                        let r = pm.data()[si];
+                        let g = pm.data()[si + 1];
+                        let b = pm.data()[si + 2];
+                        buf[di] = u32::from_ne_bytes([b, g, r, 0]);
+                    }
+                }
+                buf.present().ok();
+            }
         }
     }
-    buf.present().ok();
 }
 
 fn draw_pills(pm: &mut tiny_skia::Pixmap, pills: &[KeyLabel], cfg: &config::DisplayConfig) {
@@ -222,7 +255,9 @@ fn main() {
         rx: rx.clone(),
         tray_rx: tray_mgr.action_rx.clone(),
         display_cfg,
-        hidden: Arc::new(Mutex::new(false)),
+        tray_hidden: Arc::new(Mutex::new(false)),
+        showing: false,
+        needs_hide: false,
     };
 
     event_loop.run_app(&mut app).unwrap();
