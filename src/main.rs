@@ -47,9 +47,14 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = WindowAttributes::default()
             .with_decorations(false)
+            .with_visible(true)
             .with_inner_size(PhysicalSize::new(640, 60));
         self.window = Some(event_loop.create_window(attrs).unwrap());
-        if let Some(win) = &self.window { hide_from_taskbar(win); }
+        if let Some(win) = &self.window {
+            hide_from_taskbar(win);
+            win.set_visible(true);
+        }
+        self.showing = true;
         event_loop.set_control_flow(ControlFlow::Poll);
     }
 
