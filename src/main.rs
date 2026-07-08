@@ -40,6 +40,7 @@ struct App {
     display_cfg: config::DisplayConfig,
     tray_hidden: Arc<Mutex<bool>>,
     showing: bool,
+    ever_shown: bool,
     needs_hide: bool,
 }
 
@@ -49,12 +50,17 @@ impl ApplicationHandler for App {
             .with_decorations(false)
             .with_visible(true)
             .with_inner_size(PhysicalSize::new(640, 60));
-        self.window = Some(event_loop.create_window(attrs).unwrap());
-        if let Some(win) = &self.window {
-            hide_from_taskbar(win);
-            win.set_visible(true);
+        match event_loop.create_window(attrs) {
+            Ok(win) => {
+                hide_from_taskbar(&win);
+                let _ = win.request_redraw();
+                self.window = Some(win);
+            }
+            Err(e) => {
+                log::error!("Failed to create window: {:?}", e);
+                eprintln!("keycap: failed to create window: {:?}", e);
+            }
         }
-        self.showing = true;
         event_loop.set_control_flow(ControlFlow::Poll);
     }
 
@@ -96,13 +102,14 @@ impl ApplicationHandler for App {
         let has_content = labels.iter().any(|l| l.opacity > 0.02);
 
         if has_content {
+            self.ever_shown = true;
             self.needs_hide = false;
             if !self.showing {
                 if let Some(win) = &self.window { win.set_visible(true); }
                 self.showing = true;
             }
             if let Some(win) = &self.window { win.request_redraw(); }
-        } else if self.showing {
+        } else if self.showing && self.ever_shown {
             // Redraw one frame for fade-out, then hide
             if self.needs_hide {
                 if let Some(win) = &self.window { win.set_visible(false); }
@@ -122,7 +129,10 @@ fn redraw(window: &Window, mode: &Arc<Mutex<Box<dyn DisplayMode>>>, cfg: &config
     let w = size.width.max(1);
     let h = size.height.max(1);
 
-    let mut pm = tiny_skia::Pixmap::new(w, h).unwrap();
+    let mut pm = match tiny_skia::Pixmap::new(w, h) {
+        Some(p) => p,
+        None => { log::error!("Pixmap::new({w},{h}) failed"); return; }
+    };
 
     // Dark semi-transparent panel background
     let panel_color = parse_color(cfg.bg_color.as_str(), 0.88);
@@ -134,8 +144,14 @@ fn redraw(window: &Window, mode: &Arc<Mutex<Box<dyn DisplayMode>>>, cfg: &config
     }
 
     use raw_window_handle::{HasWindowHandle, HasDisplayHandle};
-    let wh = window.window_handle().unwrap();
-    let dh = window.display_handle().unwrap();
+    let wh = match window.window_handle() {
+        Ok(h) => h,
+        Err(e) => { log::error!("window_handle: {:?}", e); return; }
+    };
+    let dh = match window.display_handle() {
+        Ok(h) => h,
+        Err(e) => { log::error!("display_handle: {:?}", e); return; }
+    };
     if let Ok(ctx) = softbuffer::Context::new(dh) {
         if let Ok(mut surface) = softbuffer::Surface::new(&ctx, wh) {
             if let Ok(mut buf) = surface.buffer_mut() {
@@ -236,6 +252,17 @@ fn hide_from_taskbar(window: &Window) {
 }
 
 fn main() {
+    // Write panics to stderr AND log file so user can see them
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("keycap PANICKED: {}", info);
+        eprintln!("{}", msg);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(Config::log_path()) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", msg);
+        }
+    }));
+
     let mut config = Config::load();
     config.validate();
 
@@ -244,6 +271,7 @@ fn main() {
     log::set_max_level(log::LevelFilter::Info);
     let _ = log::set_boxed_logger(Box::new(FileLogger(std::sync::Mutex::new(lf))));
     log::info!("keycap starting, mode={}", config.global.mode);
+    eprintln!("keycap: starting, mode={}", config.global.mode);
 
     let rx = capture::start_capture();
     let mode = Arc::new(Mutex::new(mode::create_mode(&config)));
@@ -251,7 +279,14 @@ fn main() {
 
     let tray_mgr = tray::TrayManager::setup();
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = match EventLoop::new() {
+        Ok(el) => el,
+        Err(e) => {
+            log::error!("Failed to create event loop (no display?): {:?}", e);
+            eprintln!("keycap: failed to create event loop (no display server?): {:?}", e);
+            std::process::exit(1);
+        }
+    };
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App {
@@ -262,8 +297,16 @@ fn main() {
         display_cfg,
         tray_hidden: Arc::new(Mutex::new(false)),
         showing: false,
+        ever_shown: false,
         needs_hide: false,
     };
 
-    event_loop.run_app(&mut app).unwrap();
+    log::info!("entering event loop");
+    eprintln!("keycap: entering event loop");
+    if let Err(e) = event_loop.run_app(&mut app) {
+        log::error!("Event loop error: {:?}", e);
+        eprintln!("keycap: event loop error: {:?}", e);
+    }
+    log::info!("keycap exiting normally");
+    eprintln!("keycap: exiting");
 }
